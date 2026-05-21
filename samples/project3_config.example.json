@@ -1,0 +1,12 @@
+{
+  "target": "192.168.56.21",
+  "profile": "project3",
+  "ports": {
+    "http": 80,
+    "nextjs": 3000
+  },
+  "safe_defaults": {
+    "allow_code_exec_validation": false,
+    "allow_upload_marker": false
+  }
+}
