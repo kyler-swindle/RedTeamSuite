@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from redteamsuite.core.models import to_jsonable, utc_now_iso
 
@@ -13,14 +13,36 @@ class EvidenceStore:
         self.output_dir = output_dir
         self.http_dir = output_dir / "evidence" / "http"
         self.upload_dir = output_dir / "evidence" / "uploads"
+        self.network_dir = output_dir / "evidence" / "network"
         self.http_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self._counter = 0
-        self.findings: List[Any] = []
-        self.credentials: List[Any] = []
-        self.sessions: List[Any] = []
-        self.web_paths: List[Any] = []
-        self.uploads: List[Any] = []
+        self.network_dir.mkdir(parents=True, exist_ok=True)
+
+        self._counter = self._load_next_http_counter()
+        self.findings: List[Any] = self._load_json_list("findings.json")
+        self.credentials: List[Any] = self._load_json_list("credentials.json")
+        self.sessions: List[Any] = self._load_json_list("sessions.json")
+        self.web_paths: List[Any] = self._load_json_list("web_paths.json")
+        self.uploads: List[Any] = self._load_json_list("uploads.json")
+
+    def _load_json_list(self, filename: str) -> List[Any]:
+        path = self.output_dir / filename
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def _load_next_http_counter(self) -> int:
+        max_seen = 0
+        if self.http_dir.exists():
+            for path in self.http_dir.glob("http-*.txt"):
+                match = re.match(r"http-(\d+)_", path.name)
+                if match:
+                    max_seen = max(max_seen, int(match.group(1)))
+        return max_seen
 
     def _next_id(self, prefix: str) -> str:
         self._counter += 1
@@ -48,6 +70,14 @@ class EvidenceStore:
             body,
         ]
         path.write_text("\n".join(content), encoding="utf-8", errors="replace")
+        return evidence_id
+
+    def save_text_evidence(self, subdir: str, filename: str, content: str) -> str:
+        evidence_id = self._next_id(subdir)
+        safe_file = self._safe_name(filename)
+        path = self.output_dir / "evidence" / subdir / f"{evidence_id}_{safe_file}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8", errors="replace")
         return evidence_id
 
     def save_json(self, filename: str, data: Any) -> None:

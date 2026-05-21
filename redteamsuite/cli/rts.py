@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -11,8 +10,9 @@ from redteamsuite.core.evidence_store import EvidenceStore
 from redteamsuite.core.http_client import HttpClient
 from redteamsuite.core.models import HostProfile
 from redteamsuite.core.run_logger import RunLogger
-from redteamsuite.core.utils import make_timestamped_output_dir
+from redteamsuite.core.utils import resolve_output_dir
 from redteamsuite.modules.auth_tester import AuthTester
+from redteamsuite.modules.network_mapper import DEFAULT_PORTS, NetworkMapper
 from redteamsuite.modules.nextjs_eval_tester import NextJsEvalTester
 from redteamsuite.modules.staff_portal import StaffPortalModule
 from redteamsuite.modules.upload_tester import UploadTester
@@ -21,49 +21,106 @@ from redteamsuite.profiles.project3_profile import get_profile
 from redteamsuite.workflows.run_all import run_profile
 
 
-def build_context(args: argparse.Namespace) -> TargetContext:
+def _parse_ports(value: str) -> list[int]:
+    if value == "default":
+        return list(DEFAULT_PORTS)
+    ports: list[int] = []
+    for piece in value.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            start_s, end_s = piece.split("-", 1)
+            ports.extend(range(int(start_s), int(end_s) + 1))
+        else:
+            ports.append(int(piece))
+    return sorted(set(p for p in ports if 1 <= p <= 65535))
+
+
+def build_context(args: argparse.Namespace, *, require_target: bool = True) -> TargetContext:
+    target = getattr(args, "target", None)
+    if require_target and not target:
+        raise SystemExit("This command requires --target. Run net-map first, inspect target_candidates.json, then export/select a target manually.")
+
     output_base = Path(getattr(args, "out", None) or "output")
-    if output_base.name.endswith(".json"):
-        raise ValueError("--out must be a directory, not a JSON file")
-    if not output_base.exists() or not any(output_base.iterdir() if output_base.exists() else []):
-        output_dir = make_timestamped_output_dir(output_base, args.profile, args.target)
-    else:
-        output_dir = make_timestamped_output_dir(output_base, args.profile, args.target)
+    output_dir = resolve_output_dir(
+        output_base,
+        profile=getattr(args, "profile", "project3"),
+        target=target,
+        run_id=getattr(args, "run_id", None),
+        new_run=getattr(args, "new_run", False),
+        force_overwrite=getattr(args, "force_overwrite", False),
+    )
 
     config = RuntimeConfig(
-        target=args.target,
-        profile=args.profile,
+        target=target,
+        profile=getattr(args, "profile", "project3"),
         output_dir=output_dir,
+        run_id=getattr(args, "run_id", None),
         http_port=getattr(args, "http_port", 80),
         nextjs_port=getattr(args, "port", getattr(args, "nextjs_port", 3000)),
         allow_code_exec_validation=getattr(args, "allow_code_exec_validation", False),
         allow_upload_marker=getattr(args, "allow_upload_marker", False),
+        allow_php_exec_marker=getattr(args, "allow_php_exec_marker", False),
     )
     evidence = EvidenceStore(output_dir)
     logger = RunLogger(output_dir)
     http = HttpClient(evidence, timeout=config.timeout, user_agent=config.user_agent)
     ctx = TargetContext(config=config, evidence=evidence, logger=logger, http=http)
-    write_run_metadata(ctx)
+    write_run_metadata(ctx, command=getattr(args, "command", None))
     return ctx
 
 
-def write_run_metadata(ctx: TargetContext) -> None:
+def write_run_metadata(ctx: TargetContext, *, command: Optional[str] = None) -> None:
     ctx.evidence.save_json("run_metadata.json", {
+        "command": command,
         "target": ctx.config.target,
         "profile": ctx.config.profile,
+        "run_id": ctx.config.run_id,
+        "output_dir": str(ctx.evidence.output_dir),
         "http_port": ctx.config.http_port,
         "nextjs_port": ctx.config.nextjs_port,
         "allow_code_exec_validation": ctx.config.allow_code_exec_validation,
         "allow_upload_marker": ctx.config.allow_upload_marker,
+        "allow_php_exec_marker": ctx.config.allow_php_exec_marker,
     })
-    ctx.evidence.save_json("host_profile.json", HostProfile(target=ctx.config.target, profile=ctx.config.profile))
+    if ctx.config.target:
+        ctx.evidence.save_json("host_profile.json", HostProfile(target=ctx.config.target, profile=ctx.config.profile))
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    ctx = build_context(args)
+    ctx = build_context(args, require_target=bool(args.target))
     ctx.logger.event("init", "Initialized RedTeamSuite output directory")
     ctx.evidence.flush()
     print(f"Initialized output directory: {ctx.evidence.output_dir}")
+
+
+def cmd_net_map(args: argparse.Namespace) -> None:
+    ctx = build_context(args, require_target=False)
+    ports = _parse_ports(args.ports)
+    result = NetworkMapper(ctx).map_network(
+        args.cidr,
+        ports=ports,
+        max_hosts=args.max_hosts,
+        ping_timeout_s=args.ping_timeout,
+        connect_timeout_s=args.connect_timeout,
+        workers=args.workers,
+        use_nmap=args.use_nmap,
+    )
+    candidates = result.get("target_candidates", [])
+    print(f"Network map complete. Output: {ctx.evidence.output_dir}")
+    print(f"Alive hosts: {result.get('alive_count', 0)}")
+    if not candidates:
+        print("No target candidates scored above the threshold.")
+        return
+    print("\nTarget candidates; select manually before deeper testing:")
+    for idx, cand in enumerate(candidates, start=1):
+        ports_s = ",".join(str(p) for p in cand.get("open_ports", [])) or "none"
+        print(f"  {idx}. {cand['host']}  score={cand['score']}  confidence={cand['confidence']}  ports={ports_s}")
+        for reason in cand.get("reasons", [])[:4]:
+            print(f"     - {reason}")
+    print("\nExample next step:")
+    print(f"  export TARGET={candidates[0]['host']}  # only if this is the correct authorized target")
 
 
 def cmd_web_enum(args: argparse.Namespace) -> None:
@@ -94,7 +151,13 @@ def cmd_upload_test(args: argparse.Namespace) -> None:
         cred = next((c for c in creds if (c.role or "").lower() == "admin"), creds[0] if creds else None)
     if cred is None:
         raise SystemExit("No credentials available for upload test.")
-    session = AuthTester(ctx).login_form(ctx.config.base_http_url, profile.login_path, profile.login_username_field, profile.login_password_field, cred)
+    session = AuthTester(ctx).login_form(
+        ctx.config.base_http_url,
+        profile.login_path,
+        profile.login_username_field,
+        profile.login_password_field,
+        cred,
+    )
     if not session.valid:
         raise SystemExit(f"Login failed for {cred.username}; not attempting upload.")
     upload = UploadTester(ctx)
@@ -120,46 +183,67 @@ def cmd_run_profile(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rts", description="RedTeamSuite evidence-first lab helper")
-    parser.add_argument("--version", action="version", version="RedTeamSuite 0.1")
+    parser.add_argument("--version", action="version", version="RedTeamSuite 0.2")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add_common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--target", required=True, help="Target IP or hostname")
+    def add_output_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--profile", default="project3", help="Profile name, default: project3")
         p.add_argument("--out", default="output", help="Base output directory")
+        p.add_argument("--run-id", help="Stable run directory name under --out. Existing data is appended by default.")
+        p.add_argument("--new-run", action="store_true", help="Create a fresh timestamp-suffixed run directory.")
+        p.add_argument("--force-overwrite", action="store_true", help="Delete the selected run directory before writing. Use carefully.")
+
+    def add_target_common(p: argparse.ArgumentParser) -> None:
+        add_output_args(p)
+        p.add_argument("--target", required=True, help="Target IP or hostname. Use net-map first if unknown.")
         p.add_argument("--http-port", type=int, default=80, help="HTTP port, default: 80")
 
     p_init = sub.add_parser("init", help="Initialize a run output directory")
-    add_common(p_init)
+    add_output_args(p_init)
+    p_init.add_argument("--target", help="Optional target IP or hostname")
+    p_init.add_argument("--http-port", type=int, default=80, help="HTTP port, default: 80")
     p_init.set_defaults(func=cmd_init)
 
+    p_net = sub.add_parser("net-map", help="Map an authorized CIDR and rank probable targets")
+    add_output_args(p_net)
+    p_net.add_argument("--cidr", required=True, help="Authorized CIDR to map, e.g. 192.168.56.0/24")
+    p_net.add_argument("--ports", default="default", help="default, comma list, or ranges; e.g. 22,80,443,3000 or 1-1024")
+    p_net.add_argument("--max-hosts", type=int, default=512, help="Safety cap for hosts in CIDR")
+    p_net.add_argument("--ping-timeout", type=float, default=1.0, help="ICMP ping timeout seconds")
+    p_net.add_argument("--connect-timeout", type=float, default=0.75, help="TCP connect timeout seconds")
+    p_net.add_argument("--workers", type=int, default=64, help="Concurrent worker count")
+    p_net.add_argument("--use-nmap", action="store_true", help="Also run nmap -sV if nmap is installed")
+    p_net.set_defaults(func=cmd_net_map)
+
     p_web = sub.add_parser("web-enum", help="Fetch profile-defined web paths and record evidence")
-    add_common(p_web)
+    add_target_common(p_web)
     p_web.set_defaults(func=cmd_web_enum)
 
     p_portal = sub.add_parser("portal-test", help="Fetch and parse portal data artifacts")
-    add_common(p_portal)
+    add_target_common(p_portal)
     p_portal.set_defaults(func=cmd_portal_test)
 
     p_upload = sub.add_parser("upload-test", help="Validate authenticated upload behavior")
-    add_common(p_upload)
+    add_target_common(p_upload)
     p_upload.add_argument("--username")
     p_upload.add_argument("--password")
     p_upload.add_argument("--role", default="admin")
-    p_upload.add_argument("--allow-upload-marker", action="store_true", help="Allow harmless PHP marker upload validation")
+    p_upload.add_argument("--allow-upload-marker", action="store_true", help="Allow benign text marker upload/access validation")
+    p_upload.add_argument("--allow-php-exec-marker", action="store_true", help="Allow double-extension PHP execution marker validation")
     p_upload.set_defaults(func=cmd_upload_test)
 
     p_next = sub.add_parser("nextjs-test", help="Validate Next.js diagnostic eval behavior")
-    add_common(p_next)
+    add_target_common(p_next)
     p_next.add_argument("--port", type=int, default=3000, help="Next.js port, default: 3000")
     p_next.add_argument("--allow-code-exec-validation", action="store_true", help="Allow harmless child_process id validation")
     p_next.set_defaults(func=cmd_nextjs_test)
 
-    p_run = sub.add_parser("run-profile", help="Run profile workflow")
-    add_common(p_run)
+    p_run = sub.add_parser("run-profile", help="Run profile workflow against a manually selected target")
+    add_target_common(p_run)
     p_run.add_argument("--nextjs-port", type=int, default=3000, help="Next.js port, default: 3000")
     p_run.add_argument("--allow-code-exec-validation", action="store_true", help="Allow harmless child_process id validation")
-    p_run.add_argument("--allow-upload-marker", action="store_true", help="Allow harmless PHP marker upload validation")
+    p_run.add_argument("--allow-upload-marker", action="store_true", help="Allow benign text marker upload/access validation")
+    p_run.add_argument("--allow-php-exec-marker", action="store_true", help="Allow double-extension PHP execution marker validation")
     p_run.set_defaults(func=cmd_run_profile)
 
     return parser
