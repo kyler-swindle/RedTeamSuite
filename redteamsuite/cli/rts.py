@@ -213,12 +213,20 @@ def cmd_web_discover(args: argparse.Namespace) -> None:
     )
     ctx.evidence.save_json("web_discovery_summary.json", summary)
     ctx.evidence.flush()
-    print(f"Web discovery complete. Output: {ctx.evidence.output_dir}")
+    status = summary.get("status", "ok")
+    if status == "ok":
+        print(f"Web discovery complete. Output: {ctx.evidence.output_dir}")
+    else:
+        print(f"Web discovery completed with status={status}. Output: {ctx.evidence.output_dir}")
     print(
         "Summary: "
         f"engine={summary['engine']} services={summary['services_scanned']} "
+        f"runs={summary.get('discovery_runs', 0)} failed_runs={summary.get('failed_runs', 0)} "
+        f"gobuster_results={summary.get('gobuster_result_count', 0)} "
         f"discovered_paths={summary['discovered_paths']}"
     )
+    for err in summary.get("error_summaries", [])[:3]:
+        print(f"  warning: {err}")
     _print_recommendations(ctx)
 
 
@@ -370,7 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_discover.add_argument("--extensions", default="php,txt,html,js,bak,old", help="Comma-separated extension list passed to gobuster -x")
     p_discover.add_argument("--status-codes", default="200,204,301,302,307,308,401,403", help="Comma-separated status codes to include")
     p_discover.add_argument("--threads", type=int, default=50, help="Gobuster thread count")
-    p_discover.add_argument("--gobuster-timeout", default="10s", help="Per-request timeout passed to gobuster, e.g. 10s")
+    p_discover.add_argument("--gobuster-timeout", default="10s", help="Per-request HTTP timeout passed to gobuster, e.g. 10s; this is not a full scan runtime limit")
     p_discover.add_argument("--ports", help="Optional comma/range ports to scan, e.g. 80,3000. Defaults to discovered HTTP services.")
     p_discover.add_argument("--service-url", action="append", help="Explicit base URL to scan; may be repeated, e.g. http://host:3000")
     p_discover.add_argument("--ignore-discovered-services", action="store_true", help="Only use --service-url/--ports/fallback instead of network_services.json")

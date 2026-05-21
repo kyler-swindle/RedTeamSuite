@@ -117,6 +117,16 @@ class WebDiscoverer:
                             discovered_paths.append(child_row)
                             seen_urls.add(child_url)
 
+        gobuster_result_count = sum(len(run.get("results", []) or []) for run in discovery_runs)
+        failed_runs = [run for run in discovery_runs if run.get("success") is False]
+        failed_run_count = len(failed_runs)
+        if discovery_runs and failed_run_count == len(discovery_runs):
+            discovery_status = "failed"
+        elif failed_run_count:
+            discovery_status = "partial"
+        else:
+            discovery_status = "ok"
+
         discovered_paths = ReconWorkflow._dedupe_records(discovered_paths, key_fields=("url",))
         self.ctx.evidence.save_json("discovered_paths.json", discovered_paths)
         self.ctx.evidence.save_json("web_discovery.json", {
@@ -129,6 +139,9 @@ class WebDiscoverer:
             "status_codes": status_codes,
             "services": [s.__dict__ for s in services],
             "runs": discovery_runs,
+            "status": discovery_status,
+            "failed_runs": failed_run_count,
+            "gobuster_result_count": gobuster_result_count,
             "discovered_path_count": len(discovered_paths),
         })
 
@@ -140,9 +153,13 @@ class WebDiscoverer:
             "created_at": utc_now_iso(),
             "target": target,
             "engine": selected_engine,
+            "status": discovery_status,
             "services_scanned": len(services),
             "discovery_runs": len(discovery_runs),
+            "failed_runs": failed_run_count,
+            "gobuster_result_count": gobuster_result_count,
             "discovered_paths": len(discovered_paths),
+            "error_summaries": [run.get("error_summary") for run in failed_runs if run.get("error_summary")],
             "recon_summary": summary,
         }
 
@@ -186,8 +203,12 @@ class WebDiscoverer:
             "-w", wordlist,
             "-t", str(threads),
             "--timeout", str(gobuster_timeout),
-            "-s", status_codes,
         ]
+        if status_codes:
+            # Gobuster 3.x sets status-codes-blacklist=404 by default.
+            # It refuses to run if an allowlist (-s) and blacklist are both set,
+            # so clear the default blacklist explicitly.
+            cmd += ["-s", status_codes, "-b", ""]
         if extensions:
             cmd += ["-x", extensions]
         if json_supported:
@@ -202,6 +223,8 @@ class WebDiscoverer:
             raw,
         )
 
+        error_summary = self._summarize_gobuster_error(stderr, returncode, interrupted)
+
         mode = "json" if json_supported else "text"
         results = self._parse_gobuster_json(stdout, service) if json_supported else []
         if json_supported and not results and returncode != 0:
@@ -212,6 +235,8 @@ class WebDiscoverer:
             stdout2, stderr2, returncode2, interrupted2 = self._run_streaming(fallback_cmd, stream_to_console=True)
             raw2 = stdout2 + (("\nSTDERR:\n" + stderr2) if stderr2 else "")
             evidence_id2 = self.ctx.evidence.save_text_evidence("gobuster", f"gobuster_{service.host}_{service.port}_text_fallback.txt", raw2)
+            fallback_results = self._parse_gobuster_text(stdout2 + "\n" + stderr2, service)
+            fallback_error = self._summarize_gobuster_error(stderr2, returncode2, interrupted2)
             return {
                 "schema": "redteamsuite.gobuster_run.v1",
                 "created_at": utc_now_iso(),
@@ -221,8 +246,11 @@ class WebDiscoverer:
                 "command": fallback_cmd,
                 "returncode": returncode2,
                 "interrupted": interrupted2,
+                "success": bool(returncode2 == 0 or fallback_results),
+                "error_summary": fallback_error,
+                "stderr_sample": (stderr2 or "")[:2000],
                 "raw_evidence_id": evidence_id2,
-                "results": self._parse_gobuster_text(stdout2 + "\n" + stderr2, service),
+                "results": fallback_results,
             }
 
         if not results:
@@ -238,9 +266,26 @@ class WebDiscoverer:
             "command": cmd,
             "returncode": returncode,
             "interrupted": interrupted,
+            "success": bool(returncode == 0 or results),
+            "error_summary": error_summary,
+            "stderr_sample": (stderr or "")[:2000],
             "raw_evidence_id": evidence_id,
             "results": results,
         }
+
+    @staticmethod
+    def _summarize_gobuster_error(stderr: str, returncode: int, interrupted: bool) -> Optional[str]:
+        if interrupted:
+            return "Gobuster was interrupted; partial output may have been preserved."
+        if returncode == 0:
+            return None
+        text = (stderr or "").strip()
+        if not text:
+            return f"Gobuster exited with return code {returncode}."
+        one_line = " ".join(text.split())
+        if "status-codes" in one_line and "status-codes-blacklist" in one_line:
+            return "Gobuster status-code allowlist conflicted with the default blacklist. v0.5.1 clears the blacklist with -b ''."
+        return one_line[:500]
 
     def _run_streaming(self, cmd: List[str], *, stream_to_console: bool) -> Tuple[str, str, int, bool]:
         out_parts: List[str] = []
