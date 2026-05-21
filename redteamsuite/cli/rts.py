@@ -8,7 +8,7 @@ from redteamsuite.core.config import RuntimeConfig
 from redteamsuite.core.context import TargetContext
 from redteamsuite.core.evidence_store import EvidenceStore
 from redteamsuite.core.http_client import HttpClient
-from redteamsuite.core.models import HostProfile
+from redteamsuite.core.models import HostProfile, utc_now_iso
 from redteamsuite.core.run_logger import RunLogger
 from redteamsuite.core.utils import resolve_output_dir
 from redteamsuite.modules.auth_tester import AuthTester
@@ -67,12 +67,14 @@ def build_context(args: argparse.Namespace, *, require_target: bool = True) -> T
     logger = RunLogger(output_dir)
     http = HttpClient(evidence, timeout=config.timeout, user_agent=config.user_agent)
     ctx = TargetContext(config=config, evidence=evidence, logger=logger, http=http)
-    write_run_metadata(ctx, command=getattr(args, "command", None))
+    write_run_metadata(ctx, args=args)
     return ctx
 
 
-def write_run_metadata(ctx: TargetContext, *, command: Optional[str] = None) -> None:
-    ctx.evidence.save_json("run_metadata.json", {
+def write_run_metadata(ctx: TargetContext, *, args: argparse.Namespace) -> None:
+    command = getattr(args, "command", None)
+    row = {
+        "timestamp": utc_now_iso(),
         "command": command,
         "target": ctx.config.target,
         "profile": ctx.config.profile,
@@ -83,9 +85,28 @@ def write_run_metadata(ctx: TargetContext, *, command: Optional[str] = None) -> 
         "allow_code_exec_validation": ctx.config.allow_code_exec_validation,
         "allow_upload_marker": ctx.config.allow_upload_marker,
         "allow_php_exec_marker": ctx.config.allow_php_exec_marker,
+        "argv_options": _safe_args_dict(args),
+    }
+    ctx.evidence.upsert_run_metadata({
+        "profile": ctx.config.profile,
+        "run_id": ctx.config.run_id,
+        "output_dir": str(ctx.evidence.output_dir),
+        "last_command": command,
+        "last_target": ctx.config.target,
+        "http_port": ctx.config.http_port,
+        "nextjs_port": ctx.config.nextjs_port,
     })
+    ctx.evidence.append_jsonl("command_history.jsonl", row)
     if ctx.config.target:
         ctx.evidence.save_json("host_profile.json", HostProfile(target=ctx.config.target, profile=ctx.config.profile))
+
+
+def _safe_args_dict(args: argparse.Namespace) -> dict[str, object]:
+    data = vars(args).copy()
+    data.pop("func", None)
+    if data.get("password"):
+        data["password"] = "<redacted>"
+    return data
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -106,18 +127,42 @@ def cmd_net_map(args: argparse.Namespace) -> None:
         connect_timeout_s=args.connect_timeout,
         workers=args.workers,
         use_nmap=args.use_nmap,
+        include_self=args.include_self,
+        include_infrastructure=args.include_infrastructure,
     )
     candidates = result.get("target_candidates", [])
+    scanner_self = result.get("scanner_self", [])
+    infrastructure_hosts = result.get("infrastructure_hosts", [])
+
     print(f"Network map complete. Output: {ctx.evidence.output_dir}")
     print(f"Alive hosts: {result.get('alive_count', 0)}")
+
+    if scanner_self:
+        print("\nScanner/self hosts excluded from candidates by default:")
+        for host in scanner_self:
+            ports_s = ",".join(str(p) for p in host.get("open_ports", [])) or "none"
+            print(f"  - {host.get('host')} ports={ports_s}")
+            for reason in host.get("reasons", [])[:3]:
+                print(f"    - {reason}")
+
+    if infrastructure_hosts:
+        print("\nInfrastructure-like hosts excluded from candidates by default:")
+        for host in infrastructure_hosts:
+            ports_s = ",".join(str(p) for p in host.get("open_ports", [])) or "none"
+            print(f"  - {host.get('host')} ports={ports_s}")
+            for reason in host.get("reasons", [])[:3]:
+                print(f"    - {reason}")
+
     if not candidates:
-        print("No target candidates scored above the threshold.")
+        print("\nNo target candidates scored above the threshold.")
+        print("Use --include-self or --include-infrastructure only for debugging candidate scoring.")
         return
+
     print("\nTarget candidates; select manually before deeper testing:")
     for idx, cand in enumerate(candidates, start=1):
         ports_s = ",".join(str(p) for p in cand.get("open_ports", [])) or "none"
-        print(f"  {idx}. {cand['host']}  score={cand['score']}  confidence={cand['confidence']}  ports={ports_s}")
-        for reason in cand.get("reasons", [])[:4]:
+        print(f"  {idx}. {cand['host']}  score={cand['score']}  confidence={cand['confidence']}  classification={cand.get('classification')}  ports={ports_s}")
+        for reason in cand.get("reasons", [])[:5]:
             print(f"     - {reason}")
     print("\nExample next step:")
     print(f"  export TARGET={candidates[0]['host']}  # only if this is the correct authorized target")
@@ -183,7 +228,7 @@ def cmd_run_profile(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rts", description="RedTeamSuite evidence-first lab helper")
-    parser.add_argument("--version", action="version", version="RedTeamSuite 0.2")
+    parser.add_argument("--version", action="version", version="RedTeamSuite 0.3")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_output_args(p: argparse.ArgumentParser) -> None:
@@ -213,6 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_net.add_argument("--connect-timeout", type=float, default=0.75, help="TCP connect timeout seconds")
     p_net.add_argument("--workers", type=int, default=64, help="Concurrent worker count")
     p_net.add_argument("--use-nmap", action="store_true", help="Also run nmap -sV if nmap is installed")
+    p_net.add_argument("--include-self", action="store_true", help="Include scanner-local IPs in target_candidates for debugging only")
+    p_net.add_argument("--include-infrastructure", action="store_true", help="Include likely gateway/host/infrastructure hosts in target_candidates for debugging only")
     p_net.set_defaults(func=cmd_net_map)
 
     p_web = sub.add_parser("web-enum", help="Fetch profile-defined web paths and record evidence")

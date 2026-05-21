@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import platform
+import re
 import socket
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,6 +19,8 @@ from redteamsuite.core.models import utc_now_iso
 
 DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 5000, 5432, 8000, 8080, 8443, 3000]
 WEB_PORTS = {80, 443, 3000, 5000, 8000, 8080, 8443}
+INFRASTRUCTURE_SERVICE_HINTS = ("airtunes", "airport", "apple", "bonjour", "avahi", "cups")
+APP_TARGET_KEYWORDS = ("portal", "dashboard", "login", "admin", "next", "apache", "php", "nginx", "node")
 
 
 @dataclass
@@ -39,6 +42,8 @@ class HostProbe:
     latency_ms: Optional[float] = None
     open_ports: List[PortProbe] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    classification: str = "unknown"
+    classification_reasons: List[str] = field(default_factory=list)
 
 
 class NetworkMapper:
@@ -55,6 +60,8 @@ class NetworkMapper:
         connect_timeout_s: float = 0.75,
         workers: int = 64,
         use_nmap: bool = False,
+        include_self: bool = False,
+        include_infrastructure: bool = False,
     ) -> Dict[str, object]:
         network = ipaddress.ip_network(cidr, strict=False)
         hosts = list(network.hosts())
@@ -64,26 +71,37 @@ class NetworkMapper:
         port_list = list(ports or DEFAULT_PORTS)
         self.ctx.logger.event("netmap.start", f"Mapping network {network}", {"ports": port_list})
 
-        interface_snapshot = self._collect_interface_snapshot()
+        interface_snapshot = self._collect_interface_snapshot(str(network))
+        scanner_ips = set(interface_snapshot.get("scanner_ips_in_cidr") or [])
+        gateway_ips = set(interface_snapshot.get("gateway_ips_in_cidr") or [])
+
         alive_hosts = self._discover_hosts([str(h) for h in hosts], ping_timeout_s=ping_timeout_s, workers=workers)
-        self.ctx.evidence.save_json("network_interfaces.json", interface_snapshot)
-        self.ctx.evidence.save_json("network_hosts.json", [h.__dict__ for h in alive_hosts])
 
         for host in alive_hosts:
             host.open_ports = self._scan_ports(host.ip, port_list, timeout_s=connect_timeout_s, workers=min(workers, len(port_list) or 1))
             for probe in host.open_ports:
                 if probe.port in WEB_PORTS:
                     probe.http = self._probe_http(host.ip, probe.port)
+            self._classify_host(host, network=network, scanner_ips=scanner_ips, gateway_ips=gateway_ips)
 
-        candidates = self._score_candidates(alive_hosts)
+        candidates = self._score_candidates(alive_hosts, include_self=include_self, include_infrastructure=include_infrastructure)
+        scanner_self = [self._host_summary(h) for h in alive_hosts if h.classification == "scanner_self"]
+        infrastructure_hosts = [self._host_summary(h) for h in alive_hosts if h.classification == "infrastructure"]
+
         result = {
-            "schema": "redteamsuite.network_map.v1",
+            "schema": "redteamsuite.network_map.v2",
             "created_at": utc_now_iso(),
             "cidr": str(network),
             "ports_scanned": port_list,
             "host_count": len(hosts),
             "alive_count": len(alive_hosts),
+            "scanner_ips_in_cidr": sorted(scanner_ips),
+            "gateway_ips_in_cidr": sorted(gateway_ips),
+            "include_self": include_self,
+            "include_infrastructure": include_infrastructure,
             "hosts": [self._host_to_dict(h) for h in alive_hosts],
+            "scanner_self": scanner_self,
+            "infrastructure_hosts": infrastructure_hosts,
             "target_candidates": candidates,
             "nmap": None,
         }
@@ -91,16 +109,25 @@ class NetworkMapper:
         if use_nmap:
             result["nmap"] = self._run_nmap(str(network), port_list)
 
+        self.ctx.evidence.save_json("network_interfaces.json", interface_snapshot)
+        self.ctx.evidence.save_json("network_hosts.json", [self._host_to_dict(h) for h in alive_hosts])
         self.ctx.evidence.save_json("network_ports.json", self._flatten_ports(alive_hosts))
         self.ctx.evidence.save_json("network_services.json", self._flatten_services(alive_hosts))
+        self.ctx.evidence.save_json("scanner_self.json", scanner_self)
+        self.ctx.evidence.save_json("infrastructure_hosts.json", infrastructure_hosts)
         self.ctx.evidence.save_json("target_candidates.json", candidates)
         self.ctx.evidence.save_json("network_map.json", result)
-        self.ctx.logger.event("netmap.end", "Network mapping complete", {"alive": len(alive_hosts), "candidates": len(candidates)})
+        self.ctx.logger.event(
+            "netmap.end",
+            "Network mapping complete",
+            {"alive": len(alive_hosts), "candidates": len(candidates), "self": len(scanner_self), "infrastructure": len(infrastructure_hosts)},
+        )
         return result
 
-    def _collect_interface_snapshot(self) -> Dict[str, object]:
+    def _collect_interface_snapshot(self, cidr: str) -> Dict[str, object]:
         commands = {
             "hostname": ["hostname"],
+            "hostname_I": ["hostname", "-I"],
             "ip_addr": ["ip", "addr"],
             "ip_route": ["ip", "route"],
             "arp": ["ip", "neigh"],
@@ -113,7 +140,44 @@ class NetworkMapper:
                 self.ctx.evidence.save_text_evidence("network", f"{name}.txt", proc.stdout + ("\nSTDERR:\n" + proc.stderr if proc.stderr else ""))
             except Exception as exc:
                 snapshot["commands"][name] = {"error": str(exc)}
+
+        scanner_ips, gateway_ips = self._derive_local_network_ips(snapshot, cidr)
+        snapshot["scanner_ips_in_cidr"] = sorted(scanner_ips)
+        snapshot["gateway_ips_in_cidr"] = sorted(gateway_ips)
         return snapshot
+
+    def _derive_local_network_ips(self, snapshot: Dict[str, object], cidr: str) -> Tuple[Set[str], Set[str]]:
+        network = ipaddress.ip_network(cidr, strict=False)
+        scanner_ips: Set[str] = set()
+        gateway_ips: Set[str] = set()
+
+        def add_ip(raw: str, bucket: Set[str]) -> None:
+            try:
+                ip_obj = ipaddress.ip_address(raw)
+            except ValueError:
+                return
+            if ip_obj.version == 4 and ip_obj in network:
+                bucket.add(str(ip_obj))
+
+        commands = snapshot.get("commands") or {}
+        hostname_i = ((commands.get("hostname_I") or {}).get("stdout") or "") if isinstance(commands, dict) else ""
+        for token in hostname_i.split():
+            add_ip(token, scanner_ips)
+
+        ip_addr = ((commands.get("ip_addr") or {}).get("stdout") or "") if isinstance(commands, dict) else ""
+        for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)(?:/\d+)?", ip_addr):
+            add_ip(match.group(1), scanner_ips)
+
+        ip_route = ((commands.get("ip_route") or {}).get("stdout") or "") if isinstance(commands, dict) else ""
+        for line in ip_route.splitlines():
+            src_match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if src_match:
+                add_ip(src_match.group(1), scanner_ips)
+            via_match = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if via_match:
+                add_ip(via_match.group(1), gateway_ips)
+
+        return scanner_ips, gateway_ips
 
     def _discover_hosts(self, hosts: List[str], *, ping_timeout_s: float, workers: int) -> List[HostProbe]:
         results: List[HostProbe] = []
@@ -160,7 +224,7 @@ class NetworkMapper:
                 banner = None
                 try:
                     sock.sendall(b"\r\n")
-                    banner = sock.recv(120).decode("utf-8", errors="replace").strip() or None
+                    banner = sock.recv(240).decode("utf-8", errors="replace").strip() or None
                 except Exception:
                     pass
                 return PortProbe(port=port, state="open", service_hint=self._service_hint(port), banner=banner)
@@ -187,14 +251,94 @@ class NetworkMapper:
         except Exception as exc:
             return {"url": url, "error": str(exc)}
 
-    def _score_candidates(self, hosts: List[HostProbe]) -> List[Dict[str, object]]:
+    def _classify_host(self, host: HostProbe, *, network: ipaddress.IPv4Network, scanner_ips: Set[str], gateway_ips: Set[str]) -> None:
+        reasons: List[str] = []
+        if host.ip in scanner_ips:
+            host.classification = "scanner_self"
+            host.classification_reasons = ["Host IP matches scanner-local interface in scanned CIDR"]
+            return
+
+        ip_obj = ipaddress.ip_address(host.ip)
+        first_usable = str(next(network.hosts(), None)) if network.num_addresses > 2 else None
+        if host.ip in gateway_ips:
+            reasons.append("Host IP appears as gateway/default route for scanned CIDR")
+        if first_usable and host.ip == first_usable:
+            reasons.append("Host is first usable address in CIDR; often a host-only gateway or infrastructure endpoint")
+
+        infra_hits = self._infrastructure_service_reasons(host)
+        reasons.extend(infra_hits)
+
+        app_signal = self._has_strong_app_signal(host)
+        if reasons and not app_signal:
+            host.classification = "infrastructure"
+            host.classification_reasons = reasons
+            return
+        if reasons and app_signal:
+            host.classification = "candidate_with_infrastructure_traits"
+            host.classification_reasons = reasons + ["Strong application-target indicators were also observed"]
+            return
+
+        host.classification = "candidate"
+        host.classification_reasons = ["No self/gateway/infrastructure exclusion indicators observed"]
+
+    def _infrastructure_service_reasons(self, host: HostProbe) -> List[str]:
+        reasons: List[str] = []
+        for probe in host.open_ports:
+            haystack = " ".join(
+                str(v or "") for v in [
+                    probe.service_hint,
+                    probe.banner,
+                    (probe.http or {}).get("server"),
+                    (probe.http or {}).get("title"),
+                    (probe.http or {}).get("x_powered_by"),
+                ]
+            ).lower()
+            for keyword in INFRASTRUCTURE_SERVICE_HINTS:
+                if keyword in haystack:
+                    reasons.append(f"Infrastructure-like service indicator on TCP/{probe.port}: {keyword}")
+                    break
+        return reasons
+
+    def _has_strong_app_signal(self, host: HostProbe) -> bool:
+        for probe in host.open_ports:
+            if probe.port in {80, 443, 3000, 8000, 8080, 8443}:
+                haystack = " ".join(
+                    str(v or "") for v in [
+                        probe.service_hint,
+                        probe.banner,
+                        (probe.http or {}).get("server"),
+                        (probe.http or {}).get("title"),
+                        (probe.http or {}).get("x_powered_by"),
+                        (probe.http or {}).get("content_type"),
+                    ]
+                ).lower()
+                if any(k in haystack for k in APP_TARGET_KEYWORDS):
+                    return True
+        return False
+
+    def _score_candidates(self, hosts: List[HostProbe], *, include_self: bool, include_infrastructure: bool) -> List[Dict[str, object]]:
         candidates: List[Dict[str, object]] = []
         for host in hosts:
+            if host.classification == "scanner_self" and not include_self:
+                continue
+            if host.classification == "infrastructure" and not include_infrastructure:
+                continue
+
             score = 0
             reasons: List[str] = []
             if host.alive:
                 score += 10
                 reasons.append("Host responded to discovery probe")
+
+            if host.classification == "scanner_self":
+                score -= 35
+                reasons.extend(host.classification_reasons)
+            elif host.classification == "infrastructure":
+                score -= 25
+                reasons.extend(host.classification_reasons)
+            elif host.classification == "candidate_with_infrastructure_traits":
+                score -= 8
+                reasons.extend(host.classification_reasons)
 
             for probe in host.open_ports:
                 if probe.port in WEB_PORTS:
@@ -211,6 +355,10 @@ class NetworkMapper:
                 title = http.get("title")
                 server = http.get("server")
                 powered = http.get("x_powered_by")
+                haystack = " ".join(str(v or "") for v in [title, server, powered, probe.banner]).lower()
+                if any(k in haystack for k in INFRASTRUCTURE_SERVICE_HINTS):
+                    score -= 12
+                    reasons.append(f"Infrastructure-like service indicator on TCP/{probe.port}")
                 if title:
                     score += 8
                     reasons.append(f"HTTP title on {probe.port}: {title}")
@@ -226,16 +374,28 @@ class NetworkMapper:
 
             if score <= 10:
                 continue
-            confidence = "high" if score >= 55 else "medium" if score >= 30 else "low"
+            confidence = "high" if score >= 55 else "medium" if score >= 35 else "low"
             candidates.append({
                 "host": host.ip,
                 "score": score,
                 "confidence": confidence,
+                "classification": host.classification,
                 "open_ports": [p.port for p in host.open_ports],
-                "reasons": reasons,
+                "reasons": self._unique_reasons(reasons),
                 "recommended_next_step": f"export TARGET={host.ip}",
             })
         return sorted(candidates, key=lambda c: int(c["score"]), reverse=True)
+
+    @staticmethod
+    def _unique_reasons(reasons: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for reason in reasons:
+            if reason in seen:
+                continue
+            seen.add(reason)
+            out.append(reason)
+        return out
 
     def _run_nmap(self, cidr: str, ports: List[int]) -> Dict[str, object]:
         port_arg = ",".join(str(p) for p in ports)
@@ -259,6 +419,16 @@ class NetworkMapper:
         }.get(port, "unknown")
 
     @staticmethod
+    def _host_summary(host: HostProbe) -> Dict[str, object]:
+        return {
+            "host": host.ip,
+            "hostname": host.hostname,
+            "classification": host.classification,
+            "open_ports": [p.port for p in host.open_ports],
+            "reasons": host.classification_reasons,
+        }
+
+    @staticmethod
     def _host_to_dict(host: HostProbe) -> Dict[str, object]:
         return {
             "ip": host.ip,
@@ -268,6 +438,8 @@ class NetworkMapper:
             "latency_ms": host.latency_ms,
             "open_ports": [p.__dict__ for p in host.open_ports],
             "notes": host.notes,
+            "classification": host.classification,
+            "classification_reasons": host.classification_reasons,
         }
 
     @staticmethod
@@ -285,6 +457,7 @@ class NetworkMapper:
             for probe in host.open_ports:
                 rows.append({
                     "host": host.ip,
+                    "classification": host.classification,
                     "port": probe.port,
                     "service_hint": probe.service_hint,
                     "banner": probe.banner,

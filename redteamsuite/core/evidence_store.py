@@ -3,9 +3,97 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from redteamsuite.core.models import to_jsonable, utc_now_iso
+
+
+class DedupeFindingList(list):
+    """Append-compatible finding collection that merges repeat findings.
+
+    Most modules currently do this:
+        ctx.evidence.findings.append(Finding(...))
+
+    Keeping this as a list subclass lets those modules remain unchanged while
+    preserving append-only evidence references and preventing duplicate finding
+    rows from taking over findings.json.
+    """
+
+    def __init__(self, values: Optional[Iterable[Any]] = None):
+        super().__init__()
+        for value in values or []:
+            self.append(value)
+
+    def append(self, item: Any) -> None:  # type: ignore[override]
+        normalized = self._normalize(item)
+        key = self._key(normalized)
+        if key is None:
+            super().append(item)
+            return
+
+        for idx, existing in enumerate(self):
+            existing_norm = self._normalize(existing)
+            if self._key(existing_norm) == key:
+                self[idx] = self._merge(existing_norm, normalized)
+                return
+
+        super().append(normalized)
+
+    def extend(self, values: Iterable[Any]) -> None:  # type: ignore[override]
+        for value in values:
+            self.append(value)
+
+    @staticmethod
+    def _normalize(item: Any) -> Dict[str, Any]:
+        data = to_jsonable(item)
+        return data if isinstance(data, dict) else {"value": data}
+
+    @staticmethod
+    def _key(item: Dict[str, Any]) -> Optional[tuple[str, str]]:
+        finding_id = str(item.get("id") or "").strip()
+        target = str(item.get("target") or item.get("affected_resource") or "").strip()
+        if not finding_id:
+            return None
+        return finding_id, target
+
+    @staticmethod
+    def _unique_preserve_order(values: Iterable[Any]) -> List[Any]:
+        seen = set()
+        out: List[Any] = []
+        for value in values:
+            marker = json.dumps(value, sort_keys=True, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            out.append(value)
+        return out
+
+    def _merge(self, existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        now = utc_now_iso()
+        merged = dict(existing)
+
+        existing_meta = dict(existing.get("metadata") or {})
+        incoming_meta = dict(incoming.get("metadata") or {})
+        first_seen = existing_meta.get("first_seen") or existing.get("created_at") or incoming.get("created_at") or now
+        prev_count = int(existing_meta.get("occurrence_count") or 1)
+
+        merged["evidence_ids"] = self._unique_preserve_order(
+            list(existing.get("evidence_ids") or []) + list(incoming.get("evidence_ids") or [])
+        )
+        merged["metadata"] = {
+            **existing_meta,
+            **incoming_meta,
+            "dedupe_key": "|".join(self._key(incoming) or ("", "")),
+            "first_seen": first_seen,
+            "last_seen": now,
+            "occurrence_count": prev_count + 1,
+        }
+
+        # Preserve original created_at as first observation time, but allow fields
+        # like severity/title/remediation to stay stable from the first finding.
+        if "created_at" not in merged:
+            merged["created_at"] = first_seen
+        return merged
 
 
 class EvidenceStore:
@@ -18,28 +106,32 @@ class EvidenceStore:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.network_dir.mkdir(parents=True, exist_ok=True)
 
-        self._counter = self._load_next_http_counter()
-        self.findings: List[Any] = self._load_json_list("findings.json")
+        self._counter = self._load_next_evidence_counter()
+        self.findings: DedupeFindingList = DedupeFindingList(self._load_json_list("findings.json"))
         self.credentials: List[Any] = self._load_json_list("credentials.json")
         self.sessions: List[Any] = self._load_json_list("sessions.json")
         self.web_paths: List[Any] = self._load_json_list("web_paths.json")
         self.uploads: List[Any] = self._load_json_list("uploads.json")
 
-    def _load_json_list(self, filename: str) -> List[Any]:
+    def load_json(self, filename: str, default: Any = None) -> Any:
         path = self.output_dir / filename
         if not path.exists():
-            return []
+            return default
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return []
+            return default
+
+    def _load_json_list(self, filename: str) -> List[Any]:
+        data = self.load_json(filename, [])
         return data if isinstance(data, list) else []
 
-    def _load_next_http_counter(self) -> int:
+    def _load_next_evidence_counter(self) -> int:
         max_seen = 0
-        if self.http_dir.exists():
-            for path in self.http_dir.glob("http-*.txt"):
-                match = re.match(r"http-(\d+)_", path.name)
+        evidence_root = self.output_dir / "evidence"
+        if evidence_root.exists():
+            for path in evidence_root.rglob("*.txt"):
+                match = re.match(r"[A-Za-z_-]+-(\d+)_", path.name)
                 if match:
                     max_seen = max(max_seen, int(match.group(1)))
         return max_seen
@@ -85,9 +177,30 @@ class EvidenceStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(to_jsonable(data), indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def append_jsonl(self, filename: str, row: Dict[str, Any]) -> None:
+        path = self.output_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(to_jsonable(row), ensure_ascii=False) + "\n")
+
+    def upsert_run_metadata(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        existing = self.load_json("run_metadata.json", {})
+        existing = existing if isinstance(existing, dict) else {}
+        now = utc_now_iso()
+        merged = {
+            **existing,
+            **data,
+            "created_at": existing.get("created_at") or now,
+            "last_updated_at": now,
+        }
+        self.save_json("run_metadata.json", merged)
+        return merged
+
     def flush(self) -> None:
         self.save_json("credentials.json", self.credentials)
         self.save_json("sessions.json", self.sessions)
         self.save_json("web_paths.json", self.web_paths)
         self.save_json("uploads.json", self.uploads)
+        # Rehydrate through DedupeFindingList to merge any duplicates loaded from older runs.
+        self.findings = DedupeFindingList(self.findings)
         self.save_json("findings.json", self.findings)
