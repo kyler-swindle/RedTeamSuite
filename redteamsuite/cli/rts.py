@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from redteamsuite.core.config import RuntimeConfig
+from redteamsuite.core.config import APP_VERSION, RuntimeConfig
 from redteamsuite.core.context import TargetContext
 from redteamsuite.core.evidence_store import EvidenceStore
 from redteamsuite.core.http_client import HttpClient
@@ -111,6 +111,7 @@ def write_run_metadata(ctx: TargetContext, *, args: argparse.Namespace) -> None:
         "allow_code_exec_validation": ctx.config.allow_code_exec_validation,
         "allow_upload_marker": ctx.config.allow_upload_marker,
         "allow_php_exec_marker": ctx.config.allow_php_exec_marker,
+        "redteamsuite_version": APP_VERSION,
         "argv_options": _safe_args_dict(args),
     }
     ctx.evidence.upsert_run_metadata({
@@ -121,6 +122,7 @@ def write_run_metadata(ctx: TargetContext, *, args: argparse.Namespace) -> None:
         "last_target": ctx.config.target,
         "http_port": ctx.config.http_port,
         "nextjs_port": ctx.config.nextjs_port,
+        "redteamsuite_version": APP_VERSION,
     })
     ctx.evidence.append_jsonl("command_history.jsonl", row)
     if ctx.config.target:
@@ -238,14 +240,76 @@ def cmd_recon(args: argparse.Namespace) -> None:
         "Summary: "
         f"services={summary['http_services']} paths={summary['discovered_paths']} "
         f"artifacts={summary['content_artifacts']} auth_surfaces={summary['auth_surfaces']} "
-        f"upload_surfaces={summary['upload_surfaces']} fingerprints={summary['framework_fingerprints']}"
+        f"upload_surfaces={summary['upload_surfaces']} protected_routes={summary.get('protected_routes', 0)} "
+        f"fingerprints={summary['framework_fingerprints']}"
     )
     _print_recommendations(ctx)
 
 
 def cmd_suggest(args: argparse.Namespace) -> None:
     ctx = build_context(args, require_target=bool(args.target))
+    if getattr(args, "summary", True):
+        _print_compact_summary(ctx)
     _print_recommendations(ctx)
+
+
+def cmd_show_summary(args: argparse.Namespace) -> None:
+    ctx = build_context(args, require_target=bool(args.target))
+    _print_compact_summary(ctx, verbose=getattr(args, "verbose", False))
+
+
+def _print_compact_summary(ctx: TargetContext, *, verbose: bool = False) -> None:
+    summary = ctx.evidence.load_json("surface_summary.json", {})
+    recon = ctx.evidence.load_json("recon_summary.json", {})
+    web = ctx.evidence.load_json("web_discovery_summary.json", {})
+    if not any(isinstance(x, dict) and x for x in (summary, recon, web)):
+        print("No summary JSON found yet. Run net-map, web-discover, or recon first.")
+        return
+
+    print("Run summary:")
+    target = summary.get("target") or recon.get("target") or web.get("target") or ctx.config.target or "unknown"
+    print(f"  target: {target}")
+    if isinstance(web, dict) and web:
+        print(
+            "  web-discover: "
+            f"status={web.get('status', 'unknown')} engine={web.get('engine', 'unknown')} "
+            f"services={web.get('services_scanned', 0)} gobuster_results={web.get('gobuster_result_count', 0)} "
+            f"failed_runs={web.get('failed_runs', 0)}"
+        )
+    counts = summary.get("counts") if isinstance(summary, dict) else None
+    if isinstance(counts, dict):
+        print(
+            "  surfaces: "
+            f"paths={counts.get('discovered_paths', 0)} artifacts={counts.get('content_artifacts', 0)} "
+            f"auth={counts.get('auth_surfaces', 0)} uploads={counts.get('upload_surfaces', 0)} "
+            f"protected={counts.get('protected_routes', 0)} fingerprints={counts.get('framework_fingerprints', 0)}"
+        )
+        if summary.get("content_artifacts_by_type"):
+            print(f"  artifact types: {summary.get('content_artifacts_by_type')}")
+        if summary.get("protected_routes_by_type"):
+            print(f"  protected route types: {summary.get('protected_routes_by_type')}")
+        if summary.get("frameworks"):
+            print(f"  frameworks: {summary.get('frameworks')}")
+        notable = summary.get("notable_urls") or {}
+        for label, urls in notable.items():
+            if urls:
+                print(f"  {label}:")
+                for url in list(urls)[:8]:
+                    print(f"    - {url}")
+    elif isinstance(recon, dict) and recon:
+        print(
+            "  recon: "
+            f"paths={recon.get('discovered_paths', 0)} artifacts={recon.get('content_artifacts', 0)} "
+            f"auth={recon.get('auth_surfaces', 0)} uploads={recon.get('upload_surfaces', 0)} "
+            f"protected={recon.get('protected_routes', 0)} fingerprints={recon.get('framework_fingerprints', 0)}"
+        )
+
+    if verbose:
+        print(f"  output_dir: {ctx.evidence.output_dir}")
+        for filename in ("surface_summary.json", "protected_routes.json", "recommended_next_steps.json"):
+            path = ctx.evidence.output_dir / filename
+            if path.exists():
+                print(f"  {filename}: {path}")
 
 
 def _print_recommendations(ctx: TargetContext) -> None:
@@ -260,6 +324,9 @@ def _print_recommendations(ctx: TargetContext) -> None:
         cmd = rec.get("suggested_command")
         if cmd:
             print(f"     Command: {cmd}")
+        warning = rec.get("runtime_warning")
+        if warning:
+            print(f"     Runtime warning: {warning}")
 
 
 def cmd_web_enum(args: argparse.Namespace) -> None:
@@ -333,7 +400,7 @@ def cmd_run_profile(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rts", description="RedTeamSuite evidence-first lab helper")
-    parser.add_argument("--version", action="version", version="RedTeamSuite 0.5")
+    parser.add_argument("--version", action="version", version=f"RedTeamSuite {APP_VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_output_args(p: argparse.ArgumentParser) -> None:
@@ -385,11 +452,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_discover.add_argument("--crawl-depth", type=int, default=1, help="Bounded child expansion depth from discovered links/directory listings")
     p_discover.set_defaults(func=cmd_web_discover)
 
-    p_suggest = sub.add_parser("suggest", help="Print recommended_next_steps.json for a run")
+    p_suggest = sub.add_parser("suggest", help="Print compact run summary and recommended_next_steps.json for a run")
     add_output_args(p_suggest)
     p_suggest.add_argument("--target", help="Optional target, only used to resolve output dir when no --run-id is provided")
     p_suggest.add_argument("--http-port", type=int, default=80, help="HTTP port, default: 80")
+    p_suggest.add_argument("--no-summary", dest="summary", action="store_false", help="Only print recommendations, not the compact summary")
     p_suggest.set_defaults(func=cmd_suggest)
+
+    p_summary = sub.add_parser("show-summary", help="Print compact surface_summary/recon/web-discovery counts for a run")
+    add_output_args(p_summary)
+    p_summary.add_argument("--target", help="Optional target, only used to resolve output dir when no --run-id is provided")
+    p_summary.add_argument("--http-port", type=int, default=80, help="HTTP port, default: 80")
+    p_summary.add_argument("--verbose", action="store_true", help="Also print useful JSON file paths")
+    p_summary.set_defaults(func=cmd_show_summary)
 
     p_web = sub.add_parser("web-enum", help="Fetch profile-defined web paths and record evidence")
     add_target_common(p_web)

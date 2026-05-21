@@ -102,6 +102,7 @@ class ReconWorkflow:
         content_artifacts: List[Dict[str, Any]] = self._load_list("content_artifacts.json")
         auth_surfaces: List[Dict[str, Any]] = self._load_list("auth_surfaces.json")
         upload_surfaces: List[Dict[str, Any]] = self._load_list("upload_surfaces.json")
+        protected_routes: List[Dict[str, Any]] = self._load_list("protected_routes.json")
         framework_fingerprints: List[Dict[str, Any]] = self._load_list("framework_fingerprints.json")
 
         seen_urls = {str(row.get("url")) for row in discovered_paths if isinstance(row, dict)}
@@ -127,23 +128,27 @@ class ReconWorkflow:
         for row in discovered_paths:
             if not isinstance(row, dict):
                 continue
-            self._derive_from_path(row, content_artifacts, auth_surfaces, upload_surfaces, framework_fingerprints)
+            self._derive_from_path(row, content_artifacts, auth_surfaces, upload_surfaces, protected_routes, framework_fingerprints)
 
         discovered_paths = self._dedupe_records(discovered_paths, key_fields=("url",))
         content_artifacts = self._dedupe_records(content_artifacts, key_fields=("url", "artifact_type"))
         auth_surfaces = self._dedupe_records(auth_surfaces, key_fields=("url", "method"))
         upload_surfaces = self._dedupe_records(upload_surfaces, key_fields=("url", "method"))
+        protected_routes = self._dedupe_records(protected_routes, key_fields=("url", "status_code", "location"))
         framework_fingerprints = self._dedupe_records(framework_fingerprints, key_fields=("service_url", "framework", "source"))
 
-        self._emit_generic_findings(content_artifacts, auth_surfaces, upload_surfaces, framework_fingerprints)
-        recommendations = self._build_recommendations(target, auth_surfaces, upload_surfaces, content_artifacts, framework_fingerprints)
+        self._emit_generic_findings(content_artifacts, auth_surfaces, upload_surfaces, protected_routes, framework_fingerprints)
+        surface_summary = self._build_surface_summary(target, services, discovered_paths, content_artifacts, auth_surfaces, upload_surfaces, protected_routes, framework_fingerprints)
+        recommendations = self._build_recommendations(target, auth_surfaces, upload_surfaces, protected_routes, content_artifacts, framework_fingerprints)
 
         self.ctx.evidence.save_json("http_services.json", [s.__dict__ for s in services])
         self.ctx.evidence.save_json("discovered_paths.json", discovered_paths)
         self.ctx.evidence.save_json("content_artifacts.json", content_artifacts)
         self.ctx.evidence.save_json("auth_surfaces.json", auth_surfaces)
         self.ctx.evidence.save_json("upload_surfaces.json", upload_surfaces)
+        self.ctx.evidence.save_json("protected_routes.json", protected_routes)
         self.ctx.evidence.save_json("framework_fingerprints.json", framework_fingerprints)
+        self.ctx.evidence.save_json("surface_summary.json", surface_summary)
         self.ctx.evidence.save_json("recommended_next_steps.json", recommendations)
         self.ctx.evidence.flush()
 
@@ -156,6 +161,7 @@ class ReconWorkflow:
             "content_artifacts": len(content_artifacts),
             "auth_surfaces": len(auth_surfaces),
             "upload_surfaces": len(upload_surfaces),
+            "protected_routes": len(protected_routes),
             "framework_fingerprints": len(framework_fingerprints),
             "recommended_next_steps": len(recommendations),
         }
@@ -254,6 +260,7 @@ class ReconWorkflow:
         artifacts: List[Dict[str, Any]],
         auth_surfaces: List[Dict[str, Any]],
         upload_surfaces: List[Dict[str, Any]],
+        protected_routes: List[Dict[str, Any]],
         fingerprints: List[Dict[str, Any]],
     ) -> None:
         url = str(row.get("url") or "")
@@ -266,6 +273,10 @@ class ReconWorkflow:
             "content_type": row.get("content_type"),
         }
         evidence_ids = [row.get("evidence_id")] if row.get("evidence_id") else []
+
+        protected = self._classify_protected_route(row)
+        if protected:
+            protected_routes.append(protected)
 
         if status in {200, 301, 302, 401, 403}:
             lower_path = str(row.get("path") or "").lower()
@@ -336,6 +347,57 @@ class ReconWorkflow:
                     "source_evidence_ids": evidence_ids,
                 })
 
+    def _classify_protected_route(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        status = int(row.get("status_code") or 0)
+        url = str(row.get("url") or "")
+        path = str(row.get("path") or "")
+        lower_path = path.lower()
+        location = str(row.get("location") or "")
+        lower_location = location.lower()
+        evidence_ids = [row.get("evidence_id")] if row.get("evidence_id") else []
+        reasons: List[str] = []
+        route_types: Set[str] = set()
+
+        tokens = self._path_tokens(lower_path)
+        protectedish_name = any(t in tokens for t in {"admin", "dashboard", "portal", "staff", "manage", "console", "account", "profile", "upload", "uploads"})
+        auth_redirect = status in {301, 302, 303, 307, 308} and any(piece in lower_location for piece in ("login", "signin", "auth", "session"))
+        access_control_status = status in {401, 403}
+
+        if auth_redirect:
+            reasons.append(f"HTTP {status} redirects to authentication-like location: {location}")
+        if access_control_status:
+            reasons.append(f"HTTP {status} suggests access control or authentication requirement")
+        if protectedish_name and (auth_redirect or access_control_status):
+            reasons.append("Route name suggests protected functionality")
+
+        if not reasons:
+            return None
+
+        if any(t in tokens for t in {"admin", "manage", "console"}):
+            route_types.add("possible_admin_surface")
+        if any(t in tokens for t in {"dashboard", "portal", "staff", "account", "profile"}):
+            route_types.add("possible_authenticated_app_surface")
+        if any(t in tokens for t in {"upload", "uploads", "file", "files"}):
+            route_types.add("possible_upload_surface")
+        if not route_types:
+            route_types.add("protected_route")
+
+        confidence = "high" if protectedish_name and (auth_redirect or access_control_status) else "medium"
+        return {
+            "schema": "redteamsuite.protected_route.v1",
+            "created_at": utc_now_iso(),
+            "target": self.ctx.config.target,
+            "url": url,
+            "path": path,
+            "service_url": row.get("service_url"),
+            "status_code": status,
+            "location": location or None,
+            "route_types": sorted(route_types),
+            "confidence": confidence,
+            "reasons": reasons,
+            "source_evidence_ids": evidence_ids,
+        }
+
     def _artifact(self, row: Dict[str, Any], artifact_type: str, confidence: str, reasons: List[str]) -> Dict[str, Any]:
         return {
             "schema": "redteamsuite.content_artifact.v1",
@@ -356,6 +418,7 @@ class ReconWorkflow:
         artifacts: List[Dict[str, Any]],
         auth_surfaces: List[Dict[str, Any]],
         upload_surfaces: List[Dict[str, Any]],
+        protected_routes: List[Dict[str, Any]],
         fingerprints: List[Dict[str, Any]],
     ) -> None:
         for artifact in artifacts:
@@ -418,6 +481,18 @@ class ReconWorkflow:
                 evidence_ids=surface.get("source_evidence_ids") or [],
             )
 
+        for route in protected_routes:
+            self._append_finding(
+                finding_type="WEB_PROTECTED_ROUTE_DISCOVERED",
+                title="Protected route discovered",
+                severity="Info",
+                target=str(route.get("url")),
+                description="A route appears to require authentication or redirects to an authentication surface.",
+                impact="Protected routes help guide authenticated recon and role/authorization review.",
+                remediation="Ensure protected routes enforce authorization server-side and do not disclose sensitive metadata before authentication.",
+                evidence_ids=route.get("source_evidence_ids") or [],
+            )
+
         for fp in fingerprints:
             if str(fp.get("framework") or "").lower() in {"next.js", "node.js", "php", "apache", "nginx"}:
                 self._append_finding(
@@ -456,11 +531,80 @@ class ReconWorkflow:
         }
         self.ctx.evidence.findings.append(data)
 
+    def _build_surface_summary(
+        self,
+        target: str,
+        services: List[HttpService],
+        discovered_paths: List[Dict[str, Any]],
+        artifacts: List[Dict[str, Any]],
+        auth_surfaces: List[Dict[str, Any]],
+        upload_surfaces: List[Dict[str, Any]],
+        protected_routes: List[Dict[str, Any]],
+        fingerprints: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        def top_urls(rows: List[Dict[str, Any]], limit: int = 12) -> List[str]:
+            out: List[str] = []
+            for row in rows:
+                url = str(row.get("url") or row.get("service_url") or "")
+                if url and url not in out:
+                    out.append(url)
+                if len(out) >= limit:
+                    break
+            return out
+
+        by_status: Dict[str, int] = {}
+        for row in discovered_paths:
+            key = str(row.get("status_code") or "unknown")
+            by_status[key] = by_status.get(key, 0) + 1
+
+        artifact_counts: Dict[str, int] = {}
+        for row in artifacts:
+            key = str(row.get("artifact_type") or "unknown")
+            artifact_counts[key] = artifact_counts.get(key, 0) + 1
+
+        route_type_counts: Dict[str, int] = {}
+        for row in protected_routes:
+            for typ in row.get("route_types") or ["protected_route"]:
+                route_type_counts[str(typ)] = route_type_counts.get(str(typ), 0) + 1
+
+        framework_counts: Dict[str, int] = {}
+        for row in fingerprints:
+            key = str(row.get("framework") or "unknown")
+            framework_counts[key] = framework_counts.get(key, 0) + 1
+
+        return {
+            "schema": "redteamsuite.surface_summary.v1",
+            "created_at": utc_now_iso(),
+            "target": target,
+            "services": [s.__dict__ for s in services],
+            "counts": {
+                "http_services": len(services),
+                "discovered_paths": len(discovered_paths),
+                "content_artifacts": len(artifacts),
+                "auth_surfaces": len(auth_surfaces),
+                "upload_surfaces": len(upload_surfaces),
+                "protected_routes": len(protected_routes),
+                "framework_fingerprints": len(fingerprints),
+            },
+            "discovered_paths_by_status": dict(sorted(by_status.items())),
+            "content_artifacts_by_type": dict(sorted(artifact_counts.items())),
+            "protected_routes_by_type": dict(sorted(route_type_counts.items())),
+            "frameworks": dict(sorted(framework_counts.items())),
+            "notable_urls": {
+                "auth_surfaces": top_urls(auth_surfaces),
+                "upload_surfaces": top_urls(upload_surfaces),
+                "protected_routes": top_urls(protected_routes),
+                "credential_like_artifacts": top_urls([a for a in artifacts if a.get("artifact_type") == "credential_like"]),
+                "directory_listings": top_urls([a for a in artifacts if a.get("artifact_type") == "directory_listing"]),
+            },
+        }
+
     def _build_recommendations(
         self,
         target: str,
         auth_surfaces: List[Dict[str, Any]],
         upload_surfaces: List[Dict[str, Any]],
+        protected_routes: List[Dict[str, Any]],
         artifacts: List[Dict[str, Any]],
         fingerprints: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
@@ -473,6 +617,9 @@ class ReconWorkflow:
         is_project_profile = profile.lower() in {"project3", "p3"}
 
         credential_like = [a for a in artifacts if a.get("artifact_type") == "credential_like"]
+        protected_uploads = [r for r in protected_routes if "possible_upload_surface" in (r.get("route_types") or [])]
+        protected_admin = [r for r in protected_routes if any(t in (r.get("route_types") or []) for t in ("possible_admin_surface", "possible_authenticated_app_surface"))]
+
         if auth_surfaces and credential_like:
             out.append({
                 "priority": "high",
@@ -485,7 +632,7 @@ class ReconWorkflow:
                 },
                 "suggested_command": (
                     f"{base} portal-test {common}" if is_project_profile
-                    else f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'auth_surfaces.json'))} && cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'content_artifacts.json'))}"
+                    else f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'auth_surfaces.json'))} && python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'content_artifacts.json'))}"
                 ),
                 "requires_manual_review": True,
             })
@@ -496,8 +643,31 @@ class ReconWorkflow:
                 "title": "Review discovered authentication surfaces",
                 "reason": "Authentication-like surfaces were discovered.",
                 "evidence_inputs": {"auth_surfaces": [s.get("url") for s in auth_surfaces[:5]]},
-                "suggested_command": f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'auth_surfaces.json'))}",
+                "suggested_command": f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'auth_surfaces.json'))}",
                 "requires_manual_review": True,
+            })
+
+        if protected_routes and auth_surfaces:
+            priority = "high" if protected_uploads else "medium"
+            title = "Authenticate, then review protected routes"
+            reason_bits = ["Protected routes were discovered and at least one authentication surface exists."]
+            if protected_uploads:
+                reason_bits.append("At least one protected route has an upload-like path, so authenticated upload review may be relevant.")
+            if protected_admin:
+                reason_bits.append("Admin/dashboard-like protected routes were also observed.")
+            out.append({
+                "priority": priority,
+                "category": "authenticated_recon",
+                "title": title,
+                "reason": " ".join(reason_bits),
+                "evidence_inputs": {
+                    "auth_surfaces": [s.get("url") for s in auth_surfaces[:5]],
+                    "protected_routes": [r.get("url") for r in protected_routes[:8]],
+                    "protected_upload_like_routes": [r.get("url") for r in protected_uploads[:5]],
+                },
+                "suggested_command": f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'protected_routes.json'))}",
+                "requires_manual_review": True,
+                "runtime_warning": "Authenticated follow-up modules may take longer after login because they should revisit protected routes with a session.",
             })
 
         if upload_surfaces:
@@ -505,11 +675,11 @@ class ReconWorkflow:
                 "priority": "medium",
                 "category": "upload_validation",
                 "title": "Review discovered upload surfaces",
-                "reason": "Upload-like surfaces were discovered. Run only benign upload marker validation unless explicitly authorized for stronger checks.",
+                "reason": "Upload-like forms were discovered. Run only benign upload marker validation unless explicitly authorized for stronger checks.",
                 "evidence_inputs": {"upload_surfaces": [s.get("url") for s in upload_surfaces[:5]]},
                 "suggested_command": (
                     f"{base} upload-test {common} --allow-upload-marker" if is_project_profile
-                    else f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'upload_surfaces.json'))}"
+                    else f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'upload_surfaces.json'))}"
                 ),
                 "requires_manual_review": True,
             })
@@ -525,9 +695,10 @@ class ReconWorkflow:
                 "evidence_inputs": {"framework_fingerprints": [f.get("service_url") for f in nextjs[:5]]},
                 "suggested_command": (
                     f"{base} nextjs-test {common} --port {port}  # add --allow-code-exec-validation only when explicitly authorized" if is_project_profile
-                    else f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'framework_fingerprints.json'))}"
+                    else f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'framework_fingerprints.json'))}"
                 ),
                 "requires_manual_review": True,
+                "runtime_warning": "Framework-specific checks can be slower or more sensitive than passive recon; keep validation flags explicit.",
             })
 
         if not out:
@@ -536,7 +707,7 @@ class ReconWorkflow:
                 "category": "manual_review",
                 "title": "Review discovered paths manually",
                 "reason": "No high-confidence auth/upload/framework next step was derived. Review discovered paths and content artifacts.",
-                "suggested_command": f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'discovered_paths.json'))}",
+                "suggested_command": f"python -m json.tool {self._shell_quote(str(self.ctx.evidence.output_dir / 'surface_summary.json'))}",
                 "requires_manual_review": True,
             })
         return out
@@ -688,7 +859,7 @@ class ReconWorkflow:
 
     @staticmethod
     def _path_tokens(path: str) -> Set[str]:
-        tokens = [piece for piece in re.split(r"[^A-Za-z0-9_.-]+", path.lower()) if piece]
+        tokens = [piece for piece in re.split(r"[^A-Za-z0-9]+", path.lower()) if piece]
         return set(tokens)
 
     @staticmethod

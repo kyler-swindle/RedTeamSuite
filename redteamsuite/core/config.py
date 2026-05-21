@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 
+APP_VERSION = "0.5.2"
+
+
 @dataclass
 class RuntimeConfig:
     target: Optional[str] = None
@@ -17,7 +20,7 @@ class RuntimeConfig:
     allow_code_exec_validation: bool = False
     allow_upload_marker: bool = False
     allow_php_exec_marker: bool = False
-    user_agent: str = "RedTeamSuite/0.5 evidence-first lab client"
+    user_agent: str = f"RedTeamSuite/{APP_VERSION} evidence-first lab client"
 
     @property
     def base_http_url(self) -> str:
