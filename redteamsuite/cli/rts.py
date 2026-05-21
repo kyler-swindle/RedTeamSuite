@@ -18,6 +18,7 @@ from redteamsuite.modules.nextjs_eval_tester import NextJsEvalTester
 from redteamsuite.modules.recon import ReconWorkflow
 from redteamsuite.modules.staff_portal import StaffPortalModule
 from redteamsuite.modules.upload_tester import UploadTester
+from redteamsuite.modules.web_discovery import WebDiscoverer
 from redteamsuite.modules.web_enum import WebEnumerator
 from redteamsuite.profiles.default_profile import get_profile as get_default_profile
 from redteamsuite.profiles.project3_profile import get_profile as get_project3_profile
@@ -194,6 +195,33 @@ def cmd_net_map(args: argparse.Namespace) -> None:
     print("  python -m redteamsuite.cli.rts recon --target $TARGET --out <same_out> --run-id <same_run_id>")
 
 
+def cmd_web_discover(args: argparse.Namespace) -> None:
+    ctx = build_context(args)
+    ports = _parse_ports(args.ports) if args.ports else None
+    summary = WebDiscoverer(ctx).run(
+        target=ctx.config.target,
+        engine=args.engine,
+        wordlist=args.wordlist,
+        extensions=args.extensions,
+        status_codes=args.status_codes,
+        threads=args.threads,
+        gobuster_timeout=args.gobuster_timeout,
+        ports=ports,
+        service_urls=args.service_url or [],
+        crawl_depth=args.crawl_depth,
+        use_discovered_services=not args.ignore_discovered_services,
+    )
+    ctx.evidence.save_json("web_discovery_summary.json", summary)
+    ctx.evidence.flush()
+    print(f"Web discovery complete. Output: {ctx.evidence.output_dir}")
+    print(
+        "Summary: "
+        f"engine={summary['engine']} services={summary['services_scanned']} "
+        f"discovered_paths={summary['discovered_paths']}"
+    )
+    _print_recommendations(ctx)
+
+
 def cmd_recon(args: argparse.Namespace) -> None:
     ctx = build_context(args)
     summary = ReconWorkflow(ctx).run()
@@ -219,7 +247,7 @@ def _print_recommendations(ctx: TargetContext) -> None:
         return
     print("\nRecommended next steps:")
     for idx, rec in enumerate(recs, start=1):
-        print(f"  {idx}. [{rec.get('priority', 'unknown')}] {rec.get('category', 'next_step')}")
+        print(f"  {idx}. [{rec.get('priority', 'unknown')}] {rec.get('title') or rec.get('category', 'next_step')}")
         print(f"     Reason: {rec.get('reason')}")
         cmd = rec.get("suggested_command")
         if cmd:
@@ -297,7 +325,7 @@ def cmd_run_profile(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rts", description="RedTeamSuite evidence-first lab helper")
-    parser.add_argument("--version", action="version", version="RedTeamSuite 0.4")
+    parser.add_argument("--version", action="version", version="RedTeamSuite 0.5")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_output_args(p: argparse.ArgumentParser) -> None:
@@ -334,6 +362,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_recon = sub.add_parser("recon", help="Run default evidence-driven HTTP/service recon against a manually selected target")
     add_target_common(p_recon)
     p_recon.set_defaults(func=cmd_recon)
+
+    p_discover = sub.add_parser("web-discover", help="Run gobuster-backed web content discovery and update JSON evidence")
+    add_target_common(p_discover)
+    p_discover.add_argument("--engine", choices=["auto", "gobuster", "native"], default="auto", help="Discovery engine. auto uses gobuster when installed.")
+    p_discover.add_argument("--wordlist", help="Wordlist path. If omitted with gobuster, common Kali paths are tried; large wordlists are not bundled.")
+    p_discover.add_argument("--extensions", default="php,txt,html,js,bak,old", help="Comma-separated extension list passed to gobuster -x")
+    p_discover.add_argument("--status-codes", default="200,204,301,302,307,308,401,403", help="Comma-separated status codes to include")
+    p_discover.add_argument("--threads", type=int, default=50, help="Gobuster thread count")
+    p_discover.add_argument("--gobuster-timeout", default="10s", help="Per-request timeout passed to gobuster, e.g. 10s")
+    p_discover.add_argument("--ports", help="Optional comma/range ports to scan, e.g. 80,3000. Defaults to discovered HTTP services.")
+    p_discover.add_argument("--service-url", action="append", help="Explicit base URL to scan; may be repeated, e.g. http://host:3000")
+    p_discover.add_argument("--ignore-discovered-services", action="store_true", help="Only use --service-url/--ports/fallback instead of network_services.json")
+    p_discover.add_argument("--crawl-depth", type=int, default=1, help="Bounded child expansion depth from discovered links/directory listings")
+    p_discover.set_defaults(func=cmd_web_discover)
 
     p_suggest = sub.add_parser("suggest", help="Print recommended_next_steps.json for a run")
     add_output_args(p_suggest)

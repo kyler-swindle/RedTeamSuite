@@ -201,8 +201,10 @@ class ReconWorkflow:
         return self._dedupe_services(services)
 
     def _initial_paths(self) -> List[str]:
-        paths = list(self.profile.common_paths)
-        # Use prior robots/sitemap/path discoveries if they exist.
+        # v0.5: avoid embedded project-ish path lists. Start from tiny
+        # profile seeds plus paths already produced by web-discover, links,
+        # directory listings, robots/sitemap parsing, or other evidence.
+        paths = list(getattr(self.profile, "seed_paths", None) or getattr(self.profile, "common_paths", []) or ["/"])
         for row in self._load_list("discovered_paths.json"):
             if isinstance(row, dict) and row.get("path"):
                 paths.append(str(row["path"]))
@@ -239,7 +241,7 @@ class ReconWorkflow:
             "title": title,
             "body_length": len(text),
             "body_sample": text[:500],
-            "links": self._same_host_paths(parser.links, service.base_url),
+            "links": self._same_host_paths(parser.links, url),
             "forms": self._normalize_forms(parser.forms, url),
             "evidence_id": getattr(result, "evidence_id", None),
             "source": "recon_http_probe",
@@ -275,7 +277,8 @@ class ReconWorkflow:
                 artifacts.append(self._artifact(row, "backup_like", "medium", ["Backup/archive-like path name observed"]))
             if any(piece in lower_path for piece in ("config", ".env", "settings")):
                 artifacts.append(self._artifact(row, "config_like", "medium", ["Config-like path name observed"]))
-            if any(piece in lower_path for piece in ("log", "logs")):
+            path_tokens = self._path_tokens(lower_path)
+            if any(token in {"log", "logs"} or token.endswith(".log") for token in path_tokens):
                 artifacts.append(self._artifact(row, "log_like", "low", ["Log-like path name observed"]))
 
         for form in row.get("forms") or []:
@@ -329,6 +332,7 @@ class ReconWorkflow:
                     "source": source,
                     "value": val,
                     "confidence": "medium",
+                    "reasons": [f"{source} header/value contains {framework}"],
                     "source_evidence_ids": evidence_ids,
                 })
 
@@ -473,6 +477,7 @@ class ReconWorkflow:
             out.append({
                 "priority": "high",
                 "category": "auth_testing",
+                "title": "Review authentication surface with credential-like artifacts",
                 "reason": "Authentication surface and credential-like content were both discovered. Review the artifact before attempting login validation.",
                 "evidence_inputs": {
                     "auth_surfaces": [s.get("url") for s in auth_surfaces[:5]],
@@ -488,6 +493,7 @@ class ReconWorkflow:
             out.append({
                 "priority": "medium",
                 "category": "auth_review",
+                "title": "Review discovered authentication surfaces",
                 "reason": "Authentication-like surfaces were discovered.",
                 "evidence_inputs": {"auth_surfaces": [s.get("url") for s in auth_surfaces[:5]]},
                 "suggested_command": f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'auth_surfaces.json'))}",
@@ -498,6 +504,7 @@ class ReconWorkflow:
             out.append({
                 "priority": "medium",
                 "category": "upload_validation",
+                "title": "Review discovered upload surfaces",
                 "reason": "Upload-like surfaces were discovered. Run only benign upload marker validation unless explicitly authorized for stronger checks.",
                 "evidence_inputs": {"upload_surfaces": [s.get("url") for s in upload_surfaces[:5]]},
                 "suggested_command": (
@@ -513,6 +520,7 @@ class ReconWorkflow:
             out.append({
                 "priority": "medium",
                 "category": "framework_specific_review",
+                "title": "Review framework-specific checks",
                 "reason": "Next.js fingerprint observed. Consider framework-specific checks only after confirming the app exposes a relevant diagnostic/eval surface.",
                 "evidence_inputs": {"framework_fingerprints": [f.get("service_url") for f in nextjs[:5]]},
                 "suggested_command": (
@@ -526,6 +534,7 @@ class ReconWorkflow:
             out.append({
                 "priority": "low",
                 "category": "manual_review",
+                "title": "Review discovered paths manually",
                 "reason": "No high-confidence auth/upload/framework next step was derived. Review discovered paths and content artifacts.",
                 "suggested_command": f"cat {self._shell_quote(str(self.ctx.evidence.output_dir / 'discovered_paths.json'))}",
                 "requires_manual_review": True,
@@ -676,6 +685,11 @@ class ReconWorkflow:
             seen.add(path)
             out.append(path)
         return out
+
+    @staticmethod
+    def _path_tokens(path: str) -> Set[str]:
+        tokens = [piece for piece in re.split(r"[^A-Za-z0-9_.-]+", path.lower()) if piece]
+        return set(tokens)
 
     @staticmethod
     def _port_from_url(url: str) -> Optional[int]:
