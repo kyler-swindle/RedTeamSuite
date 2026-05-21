@@ -8,7 +8,7 @@ from typing import Optional
 @dataclass
 class RuntimeConfig:
     target: Optional[str] = None
-    profile: str = "generic"
+    profile: str = "default"
     output_dir: Optional[Path] = None
     run_id: Optional[str] = None
     http_port: int = 80
@@ -17,7 +17,7 @@ class RuntimeConfig:
     allow_code_exec_validation: bool = False
     allow_upload_marker: bool = False
     allow_php_exec_marker: bool = False
-    user_agent: str = "RedTeamSuite/0.3 evidence-first lab client"
+    user_agent: str = "RedTeamSuite/0.4 evidence-first lab client"
 
     @property
     def base_http_url(self) -> str:

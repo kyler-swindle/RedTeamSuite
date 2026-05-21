@@ -37,6 +37,9 @@ class DedupeFindingList(list):
                 self[idx] = self._merge(existing_norm, normalized)
                 return
 
+        # Ensure all finding rows have predictable dedupe metadata, even on first sighting.
+        if isinstance(normalized, dict) and self._key(normalized) is not None:
+            normalized = self._with_initial_metadata(normalized)
         super().append(normalized)
 
     def extend(self, values: Iterable[Any]) -> None:  # type: ignore[override]
@@ -50,8 +53,14 @@ class DedupeFindingList(list):
 
     @staticmethod
     def _key(item: Dict[str, Any]) -> Optional[tuple[str, str]]:
-        finding_id = str(item.get("id") or "").strip()
-        target = str(item.get("target") or item.get("affected_resource") or "").strip()
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        finding_id = str(item.get("finding_type") or item.get("id") or "").strip()
+        target = str(
+            item.get("target")
+            or item.get("affected_resource")
+            or metadata.get("affected_resource")
+            or ""
+        ).strip()
         if not finding_id:
             return None
         return finding_id, target
@@ -68,6 +77,19 @@ class DedupeFindingList(list):
             out.append(value)
         return out
 
+    def _with_initial_metadata(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        now = utc_now_iso()
+        metadata = dict(item.get("metadata") or {})
+        first_seen = metadata.get("first_seen") or item.get("created_at") or now
+        metadata.setdefault("dedupe_key", "|".join(self._key(item) or ("", "")))
+        metadata.setdefault("affected_resource", item.get("target") or item.get("affected_resource"))
+        metadata.setdefault("first_seen", first_seen)
+        metadata.setdefault("last_seen", first_seen)
+        metadata.setdefault("occurrence_count", 1)
+        out = dict(item)
+        out["metadata"] = metadata
+        return out
+
     def _merge(self, existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
         now = utc_now_iso()
         merged = dict(existing)
@@ -75,7 +97,7 @@ class DedupeFindingList(list):
         existing_meta = dict(existing.get("metadata") or {})
         incoming_meta = dict(incoming.get("metadata") or {})
         first_seen = existing_meta.get("first_seen") or existing.get("created_at") or incoming.get("created_at") or now
-        prev_count = int(existing_meta.get("occurrence_count") or 1)
+        prev_count = int(existing_meta.get("occurrence_count") or existing.get("occurrence_count") or 1)
 
         merged["evidence_ids"] = self._unique_preserve_order(
             list(existing.get("evidence_ids") or []) + list(incoming.get("evidence_ids") or [])
@@ -88,6 +110,7 @@ class DedupeFindingList(list):
             "last_seen": now,
             "occurrence_count": prev_count + 1,
         }
+        merged["finding_type"] = incoming.get("finding_type") or existing.get("finding_type") or incoming.get("id") or existing.get("id")
 
         # Preserve original created_at as first observation time, but allow fields
         # like severity/title/remediation to stay stable from the first finding.
